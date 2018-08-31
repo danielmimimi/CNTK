@@ -300,13 +300,14 @@ private:
     // Get ONNX 'pads' attribute value based on CNTK node's autoPadding attribute value.
     //
     static std::pair<std::vector<int>, std::vector<int> > GetONNXPadsAttributeFromCNTKNode(
-        const std::vector<bool>& cntkAutoPadding, const NDShape& kernelShape, bool ceilOutDim);
+        const std::vector<bool>& cntkAutoPadding, const NDShape& kernelShape, const NDShape& inputShape, 
+        const NDShape& strides, const NDShape& dilation, bool ceilOutDim);
 
     //
-    // Adds attributes 'auto_pad' or 'pads' to saved node (typically convolution or pooling).
+    // Adds attributes 'pads' to saved node (typically convolution or pooling).
     //
-    static void PutAutopadOrPadAttrInNode(LotusIR::Node* node, const std::vector<bool>& autoPadding,
-                                          const NDShape& kernelShape, bool ceilOutDim = false);
+    static void PutPadAttrInNode(LotusIR::Node* node, const std::vector<bool>& autoPadding,
+        const NDShape& kernelShape, const NDShape& inputShape, const NDShape& strides, const NDShape& dilation, bool ceilOutDim = false);
 
     //
     // Takes CNTK's OptimizedRNNStack node and converts it into a series of RNN/LSTM/GRU nodes
@@ -3650,8 +3651,16 @@ void CNTKToONNXHelper::CopyAttributes(const FunctionPtr& src, LotusIR::Node* nod
                 auto outputShape = (NDShape)src->Attributes()[L"outputShape"].Value<NDShape>();
                 if(outputShape != NDShape({ 0 }))
                     node->AddAttribute("output_shape", ToINTS(outputShape, src->Inputs()[1].HasBatchAxis()));
+                // TODO: Update exporting pad values for ConvTranspose.
+                // Notes on outputShape vs pads for convolution and convTranspose.
+                // In onnx spec for convTranspose, quoted here "If output_shape is specified pads values are ignored". 
+                // If outputShape is exported for convTranspose, autopad/pads can be skipped. 
             }
-            PutAutopadOrPadAttrInNode(node, autoPadding, kernelShape, ceilOutDim);
+            else
+            {
+                const NDShape& inputShape = src->Inputs()[1].Shape();
+                PutPadAttrInNode(node, autoPadding, kernelShape, inputShape, strides, dilations, ceilOutDim);
+            }
         }
         else if (src->OpName() == L"Pooling")
         {
@@ -3690,8 +3699,9 @@ void CNTKToONNXHelper::CopyAttributes(const FunctionPtr& src, LotusIR::Node* nod
             }
             else
             {
+                const NDShape& inputShape = src->Inputs()[0].Shape();
                 auto autoPadding = AsVector<bool>(src->Attributes()[L"autoPadding"].Value<std::vector<DictionaryValue>>());
-                PutAutopadOrPadAttrInNode(node, autoPadding, kernelShape, ceilOutDim);
+                PutPadAttrInNode(node, autoPadding, kernelShape, inputShape, strides, /*dilation=*/std::vector<size_t>(kernelShape.Rank(), 1), ceilOutDim);
             }
         }
         else if (src->OpName() == L"ReduceElements")
@@ -3761,27 +3771,22 @@ void CNTKToONNXHelper::SetReduceElementsAttributes(const FunctionPtr src, Node *
     node->AddAttribute("keepdims", keepReducedDimensions);
 }
 
-void CNTKToONNXHelper::PutAutopadOrPadAttrInNode(LotusIR::Node* node,
-                                                 const std::vector<bool>& autoPadding, const NDShape& kernelShape, bool ceilOutDim)
+void CNTKToONNXHelper::PutPadAttrInNode(LotusIR::Node* node,
+    const std::vector<bool>& autoPadding, const NDShape& kernelShape, const NDShape& inputShape, const NDShape& strides,
+    const NDShape& dilations, bool ceilOutDim)
 {
-    // Based on the CNTK node choose to put either the auto_pad or pads attribute in the ONNX node.
-
-    // ONNX spec says that if 'pads' attributes is specified then 'VALID'
-    // for 'auto_pad' is implied, and 'auto_pad' attribute should not (must not)
-    // be explicitly specified/set.
-    bool isExplicitPadValueNeeded = std::find(autoPadding.begin(), autoPadding.end(), false) != autoPadding.end();
-    if (isExplicitPadValueNeeded)
-    {
-        auto padsValueVectorsForONNX = GetONNXPadsAttributeFromCNTKNode(autoPadding, kernelShape, ceilOutDim);
-        auto lowerPads = ToINTS(padsValueVectorsForONNX.first);
-        auto upperPads = ToINTS(padsValueVectorsForONNX.second);
-        lowerPads.insert(lowerPads.end(), upperPads.cbegin(), upperPads.cend());
-        node->AddAttribute("pads", lowerPads);
-    }
-    else if (ceilOutDim)
-        node->AddAttribute("auto_pad", "SAME_LOWER");
-    else
-        node->AddAttribute("auto_pad", "SAME_UPPER");
+    // To fully support CNTK exporting of convolution & pooling ops for all input settings,
+    // The padding attributes must be exported in 'pads' instead of 'autoPad'.
+    // When padding is required, ONNX spec for autoPad has two choices of either "SAME_UPPER" or "SAME_LOWER".
+    // However in CNTK it is possible that one op has dimensions which exploits both options. 
+    // E.g.
+    //   operand shape: [7, 8], kernel shape: [2, 3], strides: [2, 2].
+    // The pad values CNTK generates is [0, 1, 1, 0]. This cannot be expressed in one single "SAME_UPPER" nor "SAME_LOWER". 
+    auto padsValueVectorsForONNX = GetONNXPadsAttributeFromCNTKNode(autoPadding, kernelShape, inputShape, strides, dilations, ceilOutDim);
+    auto lowerPads = ToINTS(padsValueVectorsForONNX.first);
+    auto upperPads = ToINTS(padsValueVectorsForONNX.second);
+    lowerPads.insert(lowerPads.end(), upperPads.cbegin(), upperPads.cend());
+    node->AddAttribute("pads", lowerPads);
 }
 
 std::vector<LotusIR::NodeArg *> CNTKToONNXHelper::MapInputsOrderToONNX(const FunctionPtr& src, const std::vector<LotusIR::NodeArg *>& inputs)
@@ -4048,24 +4053,68 @@ LotusIR::Node* CNTKToONNXHelper::AddNode(const FunctionPtr& src, LotusIR::Graph*
 }
 
 std::pair<std::vector<int>, std::vector<int>> CNTKToONNXHelper::GetONNXPadsAttributeFromCNTKNode(
-    const std::vector<bool>& cntkAutoPadding, const NDShape& kernelShape, bool ceilOutDim)
+    const std::vector<bool>& cntkAutoPadding, const NDShape& kernelShape, const NDShape& inputShape, const NDShape& strides, const NDShape& dilations, bool ceilOutDim)
 {
     // Figure out the value for 'pads' ONNX attribute.
-
-    // Only one of the two ONNX conv attributes, auto_pad and pads, can be specified in the saved model.
-    // It is assumed at this point that we need an explicit padding vector, pads, and not the auto_pad attribute.
-    // The 'auto_pad' atrribute is implied to be 'VALID' by ONNX specification if the 'pads' attribute is specified
-    // (padsValueVector) for the dimensions for which cntkAutoPadding is true.
-    assert(kernelShape.Rank() == cntkAutoPadding.size());
     std::vector<int> padsValueVectorLower(kernelShape.Rank(), 0);
     std::vector<int> padsValueVectorUpper(kernelShape.Rank(), 0);
-    for (size_t i = 0; i < cntkAutoPadding.size(); ++i)
+    for (size_t i = 0; i < kernelShape.Rank(); ++i)
     {
-        if (!cntkAutoPadding[i])
-            continue;
-        auto q = kernelShape[i] / 2;
-        padsValueVectorLower[i] = kernelShape[i] % 2 ? q : (q - 1);
-        padsValueVectorUpper[i] = q;
+        // Most of the following logic is replicated from CNTK ConvolveGeometry. 
+        size_t delta = strides[i];
+        size_t dim = inputShape[i];
+        size_t dil = dilations[i];
+        size_t effectiveKernelShape = (kernelShape[i] - 1) * dil + 1;
+        size_t paddedDim = dim;
+        
+        if (i < cntkAutoPadding.size() && cntkAutoPadding[i])
+        {
+            paddedDim += dil * (kernelShape[i] - 1);
+        }
+
+        float preciseDimOut = (float)(paddedDim - effectiveKernelShape) / delta + 1;
+        size_t dimOut = static_cast<size_t>(ceilOutDim ? ceil(preciseDimOut) : floor(preciseDimOut));
+        size_t floorDimOut = static_cast<size_t>(floor(preciseDimOut));
+
+        int upperPad = 0;
+        int lowerPad = 0;
+        if (dimOut > floorDimOut)
+        {
+            // This is a special case handling for Pooling, where ceilOutDim = True and cntkAutoPadding = False.
+            // In CNTK, no paddings should be generated since autoPadding is False. 
+            // Yet due to ceilOutDim = True, the outputShape might end up 1 size larger, requiring
+            // an input of dimension that actually exceeds the current input. 
+            // E.g.
+            //      input dim: 112, kernel size: 3, stride: 2
+            // The output dim will end up 56. 
+            // This will require an input dim of 113. 
+            // In CNTK, this issue is covered in ConvolveGeometry, where the mapping from output cell to input index,
+            // namely MpRowCol/MpRowIndices is computed. 
+            // In short, zeros are appended at upper at compute time. 
+            int cells = (dimOut - 1) * delta + 1;
+            int extra = dim - cells;
+            upperPad = effectiveKernelShape - 1 - extra;
+        }
+        else
+        {
+            if ((!cntkAutoPadding[i] || i >= cntkAutoPadding.size()))
+                continue;
+
+            int cells = (dimOut - 1) * delta + 1;
+            int extra = dim - cells;
+            int center = extra / 2;
+            upperPad = (effectiveKernelShape - 1) - (effectiveKernelShape - 1) / 2 - (extra - center);
+
+            if ((effectiveKernelShape % 2 == 1) && (extra % 2 == 1))
+            {
+                upperPad++;
+            }
+
+            lowerPad = -(center - (effectiveKernelShape - 1) / 2);
+        }
+
+        padsValueVectorLower[i] = lowerPad;
+        padsValueVectorUpper[i] = upperPad;
     }
     return std::make_pair(padsValueVectorLower, padsValueVectorUpper);
 }
