@@ -3043,6 +3043,19 @@ void CNTKToONNXHelper::ProcessInputs(const FunctionPtr& src,
             // TODO: verify - ONNX specifies that ImageScaler always need a batch axis
             inputArgType = ToTypeProto(input.Shape(), true);
         }
+        else if (cntkOpName == "Convolution" && inputIndex == 0)
+        {
+            // CNTK kernel shape can omit the out channel axis if its value equals to 1.
+            // On the other hand, ONNX spec requires out channel axis to be explicitly set. 
+            // w: [O x C x W x H], operand: [N] x [C x W x H].
+            // Thus insert the emulated out channel axis if needed. 
+            const NDShape& operandShape = src->Inputs()[1].Shape();
+            NDShape wShape = input.Shape();
+            if (operandShape.Rank() >= input.Shape().Rank())
+                wShape = wShape.AppendShape({1});
+            assert(wShape.Rank() == (operandShape.Rank() + 1));
+            inputArgType = ToTypeProto(wShape, input.HasBatchAxis(), input.HasSequenceAxis());
+        }
         else
         {
             inputArgType = ToTypeProto(input.Shape(), input.HasBatchAxis(), input.HasSequenceAxis());
@@ -4092,7 +4105,7 @@ std::pair<std::vector<int>, std::vector<int>> CNTKToONNXHelper::GetONNXPadsAttri
     {
         int upperPad = 0;
         int lowerPad = 0;
-        if ((i >= cntkAutoPadding.size() && !cntkAutoPadding[cntkAutoPadding.size() - 1]) || !cntkAutoPadding[i])
+        if ((i >= cntkAutoPadding.size() && !cntkAutoPadding[cntkAutoPadding.size() - 1]) || (i < cntkAutoPadding.size() && !cntkAutoPadding[i]))
         {
             // When autoPadding is False
             if (ceilOutDim)
